@@ -14,7 +14,7 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300, depends_on: Optional[List[str]] = None):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -23,6 +23,7 @@ class WorkflowStep:
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.depends_on = [d.strip() for d in depends_on] if depends_on else []
 
 
 class Workflow:
@@ -32,15 +33,55 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self._step_name_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        # Enforce case-insensitive unique step names
+        for existing_step in self.steps:
+            if existing_step.name.lower() == step.name.lower():
+                raise ValueError(f"Step with name '{step.name}' already exists (case-insensitive conflict with '{existing_step.name}')")
+
         self.steps.append(step)
         self._step_map[step.id] = step
+        self._step_name_map[step.name] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def validate(self) -> List[WorkflowStep]:
+        # 1. Enforce exact case-sensitive matches for dependencies, but raise helpful error on case-insensitive mismatch
+        lower_name_map = {name.lower(): step for name, step in self._step_name_map.items()}
+
+        for step in self.steps:
+            for dep in step.depends_on:
+                if dep not in self._step_name_map:
+                    if dep.lower() in lower_name_map:
+                        matched_step = lower_name_map[dep.lower()]
+                        raise ValueError(f"Dependency '{dep}' for step '{step.name}' has case mismatch with registered step '{matched_step.name}'")
+                    raise ValueError(f"Dependency '{dep}' for step '{step.name}' not found")
+
+        # 2. Circular dependency check (Cycle detection using DFS) and Topological Sort
+        visited = {}  # step.name: 0 = unvisited, 1 = visiting, 2 = visited
+        order = []
+
+        def dfs(step: WorkflowStep):
+            visited[step.name] = 1  # visiting
+            for dep_name in step.depends_on:
+                dep_step = self._step_name_map[dep_name]
+                if visited.get(dep_step.name, 0) == 1:
+                    raise ValueError(f"Circular dependency detected involving step '{step.name}' and dependency '{dep_name}'")
+                elif visited.get(dep_step.name, 0) == 0:
+                    dfs(dep_step)
+            visited[step.name] = 2  # visited
+            order.append(step)
+
+        for step in self.steps:
+            if visited.get(step.name, 0) == 0:
+                dfs(step)
+
+        return order
 
 
 class WorkflowManager:
@@ -66,8 +107,18 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        try:
+            ordered_steps = workflow.validate()
+        except ValueError as e:
+            workflow.status = StepStatus.FAILED
+            # Set failed status for all pending steps if validation fails
+            for step in workflow.steps:
+                step.status = StepStatus.FAILED
+                step.error = str(e)
+            return False
+
         workflow.status = StepStatus.RUNNING
-        for step in workflow.steps:
+        for step in ordered_steps:
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
